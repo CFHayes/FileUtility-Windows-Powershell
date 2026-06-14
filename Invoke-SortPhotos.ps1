@@ -243,10 +243,19 @@ Write-Host "[1/3] Scanning '$SourcePath'..." -ForegroundColor Cyan
 $getChildParams = @{ LiteralPath = $SourcePath; File = $true }
 if ($Recurse) { $getChildParams['Recurse'] = $true }
 
-$allFiles = Get-ChildItem @getChildParams |
-    Where-Object { $_.Extension.ToLower() -in $SupportedExtensions }
+# @() wraps the result in an array — prevents .Count failing when the
+# folder is empty or contains no matching files (PowerShell returns $null
+# from a pipeline with no results, and $null has no .Count property)
+$allFiles = @(Get-ChildItem @getChildParams |
+    Where-Object { $_.Extension.ToLower() -in $SupportedExtensions })
 
 Write-Host "      Found $($allFiles.Count) supported image file(s)."
+
+if ($allFiles.Count -eq 0) {
+    Write-Host "`n  No supported image files found in '$SourcePath'." -ForegroundColor Yellow
+    Write-Host "  Supported extensions: $($SupportedExtensions -join ', ')`n" -ForegroundColor Yellow
+    exit 0
+}
 
 # ---------------------------------------------------------------------------
 # Step 2 — Resolve best date for each file
@@ -282,8 +291,8 @@ foreach ($file in $allFiles) {
 
 Write-Progress -Activity 'Reading dates' -Completed
 
-$exifCount      = ($resolved | Where-Object { $_.DateSource -eq 'EXIF DateTimeOriginal' }).Count
-$fallbackCount  = ($resolved | Where-Object { $_.DateSource -like '*fallback*' }).Count
+$exifCount      = @($resolved | Where-Object { $_.DateSource -eq 'EXIF DateTimeOriginal' }).Count
+$fallbackCount  = @($resolved | Where-Object { $_.DateSource -like '*fallback*' }).Count
 
 Write-Host "      EXIF date found       : $exifCount file(s)"
 Write-Host "      Fallback date used    : $fallbackCount file(s)"
