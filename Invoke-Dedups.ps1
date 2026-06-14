@@ -152,7 +152,7 @@ function Get-FullHash {
 function Move-ToOutput {
     <#
     Copies a file to $DestFolder (handling name collisions), then — if not a
-    WhatIf run — deletes the source file.  Returns the destination path.
+    WhatIf run — deletes the source file.  Returns a result object with Path and Action.
     #>
     param (
         [string] $FilePath,
@@ -160,12 +160,26 @@ function Move-ToOutput {
         [bool]   $DeleteSource   # true = Move mode or DeleteCopies for duplicate
     )
 
+    # Create destination folder if it doesn't exist yet
+    if (-not (Test-Path $DestFolder)) {
+        if ($PSCmdlet.ShouldProcess($DestFolder, 'Create directory')) {
+            New-Item -ItemType Directory -Path $DestFolder -Force | Out-Null
+        }
+    }
+
     $fileName  = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
     $extension = [System.IO.Path]::GetExtension($FilePath)
     $destPath  = Join-Path $DestFolder "$fileName$extension"
 
+    # Collision handling — skip if same name + size (already processed),
+    # rename with incrementing suffix otherwise
     $counter = 1
     while (Test-Path $destPath) {
+        $existing = Get-Item $destPath
+        $incoming = Get-Item $FilePath
+        if ($existing.Length -eq $incoming.Length) {
+            return [PSCustomObject]@{ Path = $destPath; Action = 'Skipped (already exists)' }
+        }
         $destPath = Join-Path $DestFolder "${fileName}_$counter$extension"
         $counter++
     }
@@ -178,7 +192,7 @@ function Move-ToOutput {
         Remove-Item -LiteralPath $FilePath -Force
     }
 
-    return $destPath
+    return [PSCustomObject]@{ Path = $destPath; Action = if ($DeleteSource) { 'Moved' } else { 'Copied' } }
 }
 
 function Compress-Folder {
@@ -244,7 +258,14 @@ Write-Host "`n[1/4] Scanning '$SourcePath'..." -ForegroundColor Cyan
 $getChildParams = @{ LiteralPath = $SourcePath; File = $true }
 if ($Recurse) { $getChildParams['Recurse'] = $true }
 
-$allFiles = Get-ChildItem @getChildParams
+# @() guarantees an array even when the folder is empty or returns a single item
+$allFiles = @(Get-ChildItem @getChildParams)
+
+if ($allFiles.Count -eq 0) {
+    Write-Host "`n  No files found in '$SourcePath'." -ForegroundColor Yellow
+    exit 0
+}
+
 Write-Host "      Found $($allFiles.Count) file(s)."
 
 # ---------------------------------------------------------------------------
@@ -257,23 +278,27 @@ $groups = $allFiles | Group-Object -Property {
     "$($_.Length)|$($_.Extension.ToLower())"
 }
 
-$singletons      = $groups | Where-Object { $_.Count -eq 1 }
-$candidateGroups = $groups | Where-Object { $_.Count -gt 1 }
+# @() prevents null when all files are unique (no candidates) or all are dupes (no singletons)
+$singletons      = @($groups | Where-Object { $_.Count -eq 1 })
+$candidateGroups = @($groups | Where-Object { $_.Count -gt 1 })
 
-$singletonCount = ($singletons      | Measure-Object -Property Count -Sum).Sum
-$candidateCount = ($candidateGroups | Measure-Object -Property Count -Sum).Sum
+# Measure-Object returns an object with Sum=$null when the collection is empty — default to 0
+$singletonCount = if ($singletons.Count      -gt 0) { ($singletons      | Measure-Object -Property Count -Sum).Sum } else { 0 }
+$candidateCount = if ($candidateGroups.Count -gt 0) { ($candidateGroups | Measure-Object -Property Count -Sum).Sum } else { 0 }
 
 Write-Host "      Singletons (unique size+ext): $singletonCount file(s) → originals/"
 Write-Host "      Candidates for hashing:       $candidateCount file(s)"
 
+# Initialise stats before the singleton loop so Skipped can be incremented there
+$stats = @{ Originals = [int]$singletonCount; Copies = 0; Errors = 0; Deleted = 0; Skipped = 0 }
+
 # Singletons can never be duplicates — send straight to originals
 # In Move mode we delete the source; in Copy/DeleteCopies mode we leave it.
 foreach ($group in $singletons) {
-    $file = $group.Group[0]
-    Move-ToOutput -FilePath $file.FullName -DestFolder $originalsFolder -DeleteSource $Move.IsPresent | Out-Null
+    $file   = $group.Group[0]
+    $result = Move-ToOutput -FilePath $file.FullName -DestFolder $originalsFolder -DeleteSource $Move.IsPresent
+    if ($result.Action -eq 'Skipped (already exists)') { $stats.Skipped++ }
 }
-
-$stats = @{ Originals = $singletonCount; Copies = 0; Errors = 0; Deleted = 0 }
 
 # ---------------------------------------------------------------------------
 # Step 3 — Partial hash on candidates
@@ -308,9 +333,10 @@ foreach ($file in $candidateFiles) {
 Write-Progress -Activity 'Partial hashing' -Completed
 
 # Partial-hash singletons are unique — no need for full hash
-foreach ($entry in ($partialHashGroups.GetEnumerator() | Where-Object { $_.Value.Count -eq 1 })) {
-    Move-ToOutput -FilePath $entry.Value[0] -DestFolder $originalsFolder -DeleteSource $Move.IsPresent | Out-Null
-    $stats.Originals++
+foreach ($entry in @($partialHashGroups.GetEnumerator() | Where-Object { $_.Value.Count -eq 1 })) {
+    $result = Move-ToOutput -FilePath $entry.Value[0] -DestFolder $originalsFolder -DeleteSource $Move.IsPresent
+    if ($result.Action -eq 'Skipped (already exists)') { $stats.Skipped++ }
+    else { $stats.Originals++ }
 }
 
 # ---------------------------------------------------------------------------
@@ -321,8 +347,15 @@ Write-Host "`n[4/4] Running full SHA256 on partial-hash matches..." -ForegroundC
 
 $seenHashes  = @{}   # SHA256 → first-seen source path
 $phGroupList = @($partialHashGroups.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 })
-$total  = ($phGroupList | ForEach-Object { $_.Value.Count } | Measure-Object -Sum).Sum
+# Default to 0 — Measure-Object returns Sum=$null on an empty collection
+$total  = if ($phGroupList.Count -gt 0) {
+    ($phGroupList | ForEach-Object { $_.Value.Count } | Measure-Object -Sum).Sum
+} else { 0 }
 $index  = 0
+
+if ($total -eq 0) {
+    Write-Host "      No full-hash candidates — all duplicates resolved by partial hash." -ForegroundColor Cyan
+}
 
 foreach ($entry in $phGroupList) {
     foreach ($filePath in $entry.Value) {
@@ -393,6 +426,9 @@ elseif ($DeleteCopies) {
 }
 if ($Compress) {
     Write-Host "  Compressed           : $Compress  →  $OutputPath"
+}
+if ($stats.Skipped -gt 0) {
+    Write-Host "  Skipped (already exists) : $($stats.Skipped)" -ForegroundColor Yellow
 }
 if ($stats.Errors -gt 0) {
     Write-Host "  Errors               : $($stats.Errors)" -ForegroundColor Red
