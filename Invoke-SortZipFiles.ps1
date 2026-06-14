@@ -369,7 +369,7 @@ foreach ($file in $unresolved) {
         Write-Warning "Failed to copy unresolved '$($file.FullName)': $_"
         $stats.Errors++
     }
-}
+} 
 
 Write-Progress -Activity 'Sorting' -Completed
 
